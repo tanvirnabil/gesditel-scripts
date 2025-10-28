@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 # setup-gesditel-site.sh
-# Creates Apache vhosts, swaps subdomain references inside the app,
-# updates wildcard SSL certs for Apache & Asterisk, and refreshes the calendar view file.
-# Designed to be re-runnable (idempotent) and careful (backups + checks).
+# Automates Apache vhost setup, SSL update, and calendar view refresh for gesditel.app subdomains.
 
 set -Eeuo pipefail
 
@@ -19,7 +17,7 @@ ASTERISK_PEM="${ASTERISK_KEYS_DIR}/asterisk.pem"
 
 # Remote assets
 REMOTE_CERT_URL="https://config-telemarketing.gesditel.app/wildcard/certificate.pem"
-REMOTE_CAL_ZIP="https://config-telemarketing.gesditel.app/calendar/calendar.zip"
+REMOTE_CAL_TAR="https://config-telemarketing.gesditel.app/calendar/calendar.tar"
 
 # Calendar (CodeIgniter view)
 CAL_DIR="${WWW_PATH}/${APP_DIR}/application/views/report"
@@ -46,7 +44,6 @@ require_root() {
 
 ts() { date +"%Y%m%d-%H%M%S"; }
 
-# Download helper: prefers curl, falls back to wget
 fetch() {
   local url="$1" dest="$2"
   if command -v curl >/dev/null 2>&1; then
@@ -146,9 +143,8 @@ systemctl reload apache2
 ### ------------------------ IN-PROJECT DOMAIN REPLACE ----------------------
 log "Replacing '${DEMO_HOST}' → '${SUBDOMAIN}.gesditel.app' inside ${WWW_PATH}/${APP_DIR} (if present)..."
 if [[ -d "${WWW_PATH}/${APP_DIR}" ]]; then
-  # Only run sed on files containing the pattern; ignore binary files
   set +e
-  mapfile -t hits < <(grep -rIl --exclude-dir=.git --exclude-dir=node_modules --exclude='*.zip' --exclude='*.tar*' "${DEMO_HOST}" "${WWW_PATH}/${APP_DIR}" 2>/dev/null)
+  mapfile -t hits < <(grep -rIl --exclude-dir=.git --exclude-dir=node_modules --exclude='*.tar*' "${DEMO_HOST}" "${WWW_PATH}/${APP_DIR}" 2>/dev/null)
   set -e
   if [[ ${#hits[@]} -gt 0 ]]; then
     for f in "${hits[@]}"; do
@@ -170,19 +166,16 @@ tmp_cert="$(mktemp /tmp/cert.XXXXXX.pem)"
 log "Downloading wildcard cert from: ${REMOTE_CERT_URL}"
 fetch "${REMOTE_CERT_URL}" "${tmp_cert}"
 
-# Backup & replace wildcard cert
 backup_if_exists "$WILDCARD_CERT"
 install -m 0644 -o root -g root "${tmp_cert}" "${WILDCARD_CERT}"
 rm -f "${tmp_cert}"
 
-# Copy to Asterisk keys (backup first)
 backup_if_exists "$ASTERISK_PEM"
 install -m 0640 -o root -g asterisk "${WILDCARD_CERT}" "${ASTERISK_PEM}"
 
-# Reload services
 if command -v asterisk >/dev/null 2>&1; then
   log "Reloading Asterisk..."
-  asterisk -rx "core reload" || warn "Asterisk reload returned a non-zero status (check if Asterisk is running)."
+  asterisk -rx "core reload" || warn "Asterisk reload returned non-zero status."
 else
   warn "Asterisk binary not found; skipping Asterisk reload."
 fi
@@ -193,38 +186,24 @@ systemctl reload apache2
 ### --------------------------- CALENDAR FILE UPDATE ------------------------
 log "Updating calendar view file..."
 mkdir -p "${CAL_DIR}"
-
 pushd "${CAL_DIR}" >/dev/null
 
-# Backup existing calendar.php (if present)
 backup_if_exists "${CAL_FILE}"
 
-# Fetch & extract new calendar package into CAL_DIR
-zip_tmp="$(mktemp /tmp/calendar.XXXXXX.zip)"
-log "Downloading calendar zip from: ${REMOTE_CAL_ZIP}"
-fetch "${REMOTE_CAL_ZIP}" "${zip_tmp}"
+tmp_tar="$(mktemp /tmp/calendar.XXXXXX.tar)"
+log "Downloading calendar tar from: ${REMOTE_CAL_TAR}"
+fetch "${REMOTE_CAL_TAR}" "${tmp_tar}"
 
-log "Extracting calendar.zip..."
-# Extract quietly but show file list once; use tar for .zip? We'll use 'unzip' if present, else 'busybox unzip' if available
-if command -v unzip >/dev/null 2>&1; then
-  unzip -o "${zip_tmp}"
-else
-  # Try using tar as a fallback only if it's actually a tar zip (not typical). If unzip is missing, we install minimal fallback:
-  error "The 'unzip' utility is required to extract ${zip_tmp}. Please install it (e.g., apt-get install -y unzip) and re-run."
-  rm -f "${zip_tmp}"
-  popd >/dev/null
-  exit 1
-fi
+log "Extracting calendar.tar..."
+tar -xf "${tmp_tar}" || { error "Extraction failed — check that calendar.tar is valid."; exit 1; }
+rm -f "${tmp_tar}"
 
-rm -f "${zip_tmp}"
-
-# Ensure ownership and sane perms for the file we care about
 if [[ -f "${CAL_FILE}" ]]; then
-  chown asterisk:asterisk "${CAL_FILE}" || warn "Could not chown ${CAL_FILE} to asterisk:asterisk"
+  chown asterisk:asterisk "${CAL_FILE}" || warn "Could not chown ${CAL_FILE}"
   chmod 0644 "${CAL_FILE}" || true
   log "calendar.php updated and permissions set."
 else
-  warn "calendar.php was not found after extraction. Please verify the zip contents."
+  warn "calendar.php not found after extraction. Please verify the tar contents."
 fi
 
 popd >/dev/null
